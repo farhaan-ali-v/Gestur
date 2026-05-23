@@ -145,6 +145,15 @@ export default function CaptchaWidget() {
       recognizerRef.current.close()
       recognizerRef.current = null
     }
+
+    if (canvasRef.current && contextRef.current) {
+      contextRef.current.clearRect(
+        0,
+        0,
+        canvasRef.current.width,
+        canvasRef.current.height,
+      )
+    }
   }
 
   const resetState = () => {
@@ -276,6 +285,7 @@ export default function CaptchaWidget() {
         new TextEncoder().encode(signaturePayload),
       )
       const signature = arrayBufferToBase64(signatureBuffer)
+      const urlToken = new URLSearchParams(window.location.search).get('token')
 
       const response = await fetch('/api/challenge', {
         method: 'POST',
@@ -284,6 +294,7 @@ export default function CaptchaWidget() {
           nonce: challengeData.nonce,
           clientTimestamp,
           signature,
+          token: urlToken,
         }),
       })
 
