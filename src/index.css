@@ -1,0 +1,54 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    color-scheme: dark;
+  }
+
+  body {
+    @apply bg-void text-ink font-display antialiased;
+    margin: 0;
+  }
+
+  #root {
+    min-height: 100vh;
+  }
+
+  button {
+    font-family: inherit;
+  }
+}
+
+@layer components {
+  .brutal-panel {
+    @apply border-2 border-ink bg-graphite p-6 shadow-brutal;
+  }
+
+  .brutal-button {
+    @apply border-2 border-ink bg-neon px-6 py-3 text-xs font-semibold uppercase tracking-[0.35em] text-void shadow-brutal transition;
+  }
+
+  .brutal-button:hover {
+    @apply -translate-y-0.5;
+  }
+
+  .status-chip {
+    @apply inline-flex items-center gap-2 border-2 px-3 py-1 text-[0.65rem] uppercase tracking-[0.3em];
+  }
+
+  .checkmark {
+    width: 64px;
+    height: 32px;
+    border-left: 10px solid #00FF7F;
+    border-bottom: 10px solid #00FF7F;
+    transform: rotate(-45deg);
+  }
+}
+
+@layer utilities {
+  .mirror {
+    transform: scaleX(-1);
+  }
+}
