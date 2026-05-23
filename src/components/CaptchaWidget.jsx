@@ -19,8 +19,8 @@ const DISPLAY_GESTURES = {
 }
 
 const SCORE_THRESHOLD = 0.6
-const Z_HISTORY_LENGTH = 15
-const Z_VARIANCE_THRESHOLD = 0.0001
+const Z_HISTORY_LENGTH = 20
+const Z_VARIANCE_THRESHOLD = 0.00001
 const SIGNING_SALT = 'GesturLiveness'
 const HAND_CONNECTIONS = [
   [0, 1],
@@ -89,7 +89,7 @@ export default function CaptchaWidget() {
   const challengeRef = useRef(challenge)
   const contextRef = useRef(null)
   const sequenceIndexRef = useRef(0)
-  const zHistoryRef = useRef({ wrist: [], index: [] })
+  const zHistoryRef = useRef({ depthDelta: [] })
   const spoofRef = useRef(false)
   const keyPairRef = useRef(null)
 
@@ -102,6 +102,8 @@ export default function CaptchaWidget() {
     () => formatGestureLabel(expectedLabel),
     [expectedLabel],
   )
+
+  const hasTarget = Boolean(expectedLabel)
 
   const sequenceDisplay = useMemo(() => {
     if (!challenge?.sequence?.length) return ''
@@ -156,7 +158,7 @@ export default function CaptchaWidget() {
     verifyingRef.current = false
     lastVideoTimeRef.current = -1
     sequenceIndexRef.current = 0
-    zHistoryRef.current = { wrist: [], index: [] }
+    zHistoryRef.current = { depthDelta: [] }
     spoofRef.current = false
     keyPairRef.current = null
   }
@@ -307,37 +309,29 @@ export default function CaptchaWidget() {
   }
 
   const updateZHistory = (landmarks) => {
-    const wrist = landmarks?.[0]
+    const thumbTip = landmarks?.[4]
     const indexTip = landmarks?.[8]
 
-    if (!wrist || !indexTip) return
+    if (!thumbTip || !indexTip) return
 
     const history = zHistoryRef.current
-    history.wrist.push(wrist.z)
-    history.index.push(indexTip.z)
+    const depthDelta = Math.abs(indexTip.z - thumbTip.z)
+    history.depthDelta.push(depthDelta)
 
-    if (history.wrist.length > Z_HISTORY_LENGTH) {
-      history.wrist.shift()
-    }
-
-    if (history.index.length > Z_HISTORY_LENGTH) {
-      history.index.shift()
+    if (history.depthDelta.length > Z_HISTORY_LENGTH) {
+      history.depthDelta.shift()
     }
   }
 
   const isSpoofDetected = () => {
-    const { wrist, index } = zHistoryRef.current
-    if (wrist.length < Z_HISTORY_LENGTH || index.length < Z_HISTORY_LENGTH) {
+    const { depthDelta } = zHistoryRef.current
+    if (depthDelta.length < Z_HISTORY_LENGTH) {
       return false
     }
 
-    const wristVariance = calculateVariance(wrist)
-    const indexVariance = calculateVariance(index)
+    const variance = calculateVariance(depthDelta)
 
-    return (
-      wristVariance < Z_VARIANCE_THRESHOLD &&
-      indexVariance < Z_VARIANCE_THRESHOLD
-    )
+    return variance < Z_VARIANCE_THRESHOLD
   }
 
   const drawSkeleton = (landmarks) => {
@@ -559,59 +553,66 @@ export default function CaptchaWidget() {
               </ul>
             </div>
 
-            {status === STATUS.idle && (
+            <div className="flex min-h-[240px] flex-col gap-4">
               <button
                 type="button"
-                className="brutal-button"
-                onClick={startVerification}
+                className={`brutal-button ${
+                  status === STATUS.idle ? '' : 'cursor-not-allowed opacity-40'
+                }`}
+                onClick={status === STATUS.idle ? startVerification : undefined}
+                disabled={status !== STATUS.idle}
               >
                 Verify Human Kinetic State
               </button>
-            )}
 
-            {status !== STATUS.idle && status !== STATUS.success && (
-              <div className="flex flex-col gap-3 text-sm text-white/70">
+              <div className="flex flex-col gap-2 text-sm text-white/70">
                 <p>
                   {status === STATUS.connecting
                     ? 'Connecting to sensors and gatekeeper...'
-                    : 'Processing live gesture telemetry.'}
+                    : status === STATUS.processing
+                      ? 'Processing live gesture telemetry.'
+                      : status === STATUS.active
+                        ? 'Tracking live gesture telemetry.'
+                        : status === STATUS.verifying
+                          ? 'Finalizing verification.'
+                          : 'Awaiting verification.'}
                 </p>
-                {lastGesture && (
-                  <p className="text-neon">Last detected: {lastGesture}</p>
-                )}
+                <p className={`text-neon ${lastGesture ? '' : 'opacity-0'}`}>
+                  Last detected: {lastGesture || '...'}
+                </p>
               </div>
-            )}
 
-            {status === STATUS.success && (
-              <div className="flex flex-col gap-4 border-2 border-success bg-black/60 p-6 text-success">
-                <div className="flex items-center gap-6">
-                  <span className="checkmark" aria-hidden="true" />
-                  <div>
-                    <p className="text-xs uppercase tracking-[0.4em]">Pass</p>
-                    <h3 className="text-3xl uppercase tracking-[0.2em]">Verified</h3>
+              {status === STATUS.success && (
+                <div className="flex flex-col gap-4 border-2 border-success bg-black/60 p-6 text-success">
+                  <div className="flex items-center gap-6">
+                    <span className="checkmark" aria-hidden="true" />
+                    <div>
+                      <p className="text-xs uppercase tracking-[0.4em]">Pass</p>
+                      <h3 className="text-3xl uppercase tracking-[0.2em]">Verified</h3>
+                    </div>
                   </div>
+                  <div className="text-xs text-white/70">
+                    Session token issued.
+                  </div>
+                  <button type="button" className="brutal-button" onClick={resetState}>
+                    Reset Session
+                  </button>
                 </div>
-                <div className="text-xs text-white/70">
-                  Session token issued.
-                </div>
-                <button type="button" className="brutal-button" onClick={resetState}>
-                  Reset Session
-                </button>
-              </div>
-            )}
+              )}
 
-            {status === STATUS.error && (
-              <div className="border-2 border-danger bg-black/60 p-4 text-sm text-danger">
-                <p>{error || 'Unexpected failure.'}</p>
-                <button
-                  type="button"
-                  className="brutal-button mt-4"
-                  onClick={resetState}
-                >
-                  Reset Session
-                </button>
-              </div>
-            )}
+              {status === STATUS.error && (
+                <div className="border-2 border-danger bg-black/60 p-4 text-sm text-danger">
+                  <p>{error || 'Unexpected failure.'}</p>
+                  <button
+                    type="button"
+                    className="brutal-button mt-4"
+                    onClick={resetState}
+                  >
+                    Reset Session
+                  </button>
+                </div>
+              )}
+            </div>
           </section>
 
           <section className="brutal-panel flex flex-col gap-4">
@@ -642,19 +643,23 @@ export default function CaptchaWidget() {
               )}
             </div>
 
-            {expectedLabel && (
-              <div className="border-2 border-neon bg-black/70 p-4 text-neon">
-                <p className="text-xs uppercase tracking-[0.4em]">
-                  Target Gesture
-                </p>
-                <p className="mt-2 text-sm uppercase tracking-[0.3em] text-neon/70">
-                  Step {sequenceIndex + 1} of {challenge?.sequence?.length}
-                </p>
-                <p className="mt-2 text-2xl font-semibold uppercase tracking-[0.2em]">
-                  Hold up a {expectedDisplay}
-                </p>
-              </div>
-            )}
+            <div
+              className={`border-2 p-4 ${
+                hasTarget
+                  ? 'border-neon bg-black/70 text-neon'
+                  : 'border-ink/40 bg-black/40 text-white/40'
+              }`}
+            >
+              <p className="text-xs uppercase tracking-[0.4em]">Target Gesture</p>
+              <p className="mt-2 text-sm uppercase tracking-[0.3em]">
+                {hasTarget
+                  ? `Step ${sequenceIndex + 1} of ${challenge?.sequence?.length}`
+                  : 'Awaiting challenge'}
+              </p>
+              <p className="mt-2 text-2xl font-semibold uppercase tracking-[0.2em]">
+                Hold up a {hasTarget ? expectedDisplay : 'gesture'}
+              </p>
+            </div>
           </section>
         </main>
       </div>

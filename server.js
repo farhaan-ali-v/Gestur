@@ -5,6 +5,10 @@ import jwt from 'jsonwebtoken'
 const app = express()
 const PORT = process.env.PORT || 3001
 const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex')
+const DISCORD_GUILD_ID = process.env.DISCORD_GUILD_ID
+const VERIFIED_ROLE_ID = process.env.DISCORD_VERIFIED_ROLE_ID
+const VERIFIED_ROLE_NAME = 'Verified'
+const discordClient = globalThis.discordClient
 
 const CHALLENGE_TTL_MS = 10_000
 const SIGNING_SALT = 'GesturLiveness'
@@ -60,15 +64,15 @@ app.post('/api/challenge', (req, res) => {
   res.json({ nonce, issuedAt, expiresAt, sequence })
 })
 
-app.post('/api/verify', (req, res) => {
-  const { nonce, clientTimestamp, signature } = req.body || {}
+app.post('/api/verify', async (req, res) => {
+  const { nonce, clientTimestamp, signature, token } = req.body || {}
   const challenge = activeChallenges.get(nonce)
 
   if (!challenge) {
     return res.status(401).json({ ok: false, reason: 'Invalid nonce.' })
   }
 
-  if (typeof clientTimestamp !== 'number' || !signature) {
+  if (typeof clientTimestamp !== 'number' || !signature || !token) {
     return res.status(400).json({ ok: false, reason: 'Missing verification data.' })
   }
 
@@ -88,7 +92,7 @@ app.post('/api/verify', (req, res) => {
   const isValid = crypto.verify(
     'SHA256',
     Buffer.from(payload),
-    { key: publicKeyPem, dsaEncoding: 'ieee-p1363' },
+    { key: publicKeyPem, dsaEncoding: 'der' },
     Buffer.from(signature, 'base64'),
   )
 
@@ -99,20 +103,64 @@ app.post('/api/verify', (req, res) => {
       .json({ ok: false, reason: 'Hardware attestation failed. Headless bot detected.' })
   }
 
-  const token = jwt.sign(
-    {
-      sub: 'gestur-human',
-      nonce,
-      issuedAt: challenge.issuedAt,
-      sequence: challenge.sequence,
-    },
-    JWT_SECRET,
-    { expiresIn: '5m' },
-  )
+  let discordUserId
 
-  activeChallenges.delete(nonce)
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET)
+    discordUserId = decoded?.discordUserId
+  } catch (err) {
+    activeChallenges.delete(nonce)
+    return res.status(401).json({ ok: false, reason: 'Invalid token.' })
+  }
 
-  return res.json({ ok: true, token })
+  if (!discordUserId) {
+    activeChallenges.delete(nonce)
+    return res.status(400).json({ ok: false, reason: 'discordUserId missing.' })
+  }
+
+  if (!discordClient?.isReady?.()) {
+    activeChallenges.delete(nonce)
+    return res
+      .status(503)
+      .json({ ok: false, reason: 'Discord client unavailable.' })
+  }
+
+  if (!DISCORD_GUILD_ID) {
+    activeChallenges.delete(nonce)
+    return res.status(500).json({ ok: false, reason: 'Guild ID not configured.' })
+  }
+
+  const guild = discordClient.guilds.cache.get(DISCORD_GUILD_ID)
+
+  if (!guild) {
+    activeChallenges.delete(nonce)
+    return res.status(404).json({ ok: false, reason: 'Guild not found.' })
+  }
+
+  try {
+    const member = await guild.members.fetch(discordUserId)
+
+    const verifiedRole = VERIFIED_ROLE_ID
+      ? guild.roles.cache.get(VERIFIED_ROLE_ID)
+      : guild.roles.cache.find((role) => role.name === VERIFIED_ROLE_NAME)
+
+    if (!verifiedRole) {
+      activeChallenges.delete(nonce)
+      return res
+        .status(404)
+        .json({ ok: false, reason: 'Verified role not found.' })
+    }
+
+    await member.roles.add(verifiedRole)
+
+    activeChallenges.delete(nonce)
+
+    return res.json({ ok: true, discordUserId, role: verifiedRole.id })
+  } catch (err) {
+    activeChallenges.delete(nonce)
+    return res.status(500).json({ ok: false, reason: 'Discord role assign failed.' })
+  }
+
 })
 
 app.listen(PORT, () => {
