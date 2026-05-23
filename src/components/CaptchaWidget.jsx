@@ -180,7 +180,7 @@ export default function CaptchaWidget() {
   }
 
   const requestChallenge = async (clientPublicKey) => {
-    const response = await fetch('http://banana.fps.ms:11068/api/challenge', {
+    const response = await fetch('/api/challenge', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ clientPublicKey }),
@@ -275,7 +275,7 @@ export default function CaptchaWidget() {
       )
       const signature = arrayBufferToBase64(signatureBuffer)
 
-      const response = await fetch('http://banana.fps.ms:11068/api/verify', {
+      const response = await fetch('/api/challenge', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
