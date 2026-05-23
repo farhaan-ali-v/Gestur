@@ -12,109 +12,65 @@ const STATUS = {
   spoof: 'spoof',
 }
 
-const DISPLAY_GESTURES = {
-  Victory: 'Peace Sign',
-  Open_Palm: 'Open Palm',
-  Closed_Fist: 'Closed Fist',
-}
-
-const SCORE_THRESHOLD = 0.6
 const Z_HISTORY_LENGTH = 15
 const Z_VARIANCE_THRESHOLD = 0.0001
 const SIGNING_SALT = 'GesturLiveness'
 const HAND_CONNECTIONS = [
-  [0, 1],
-  [1, 2],
-  [2, 3],
-  [3, 4],
-  [0, 5],
-  [5, 6],
-  [6, 7],
-  [7, 8],
-  [5, 9],
-  [9, 10],
-  [10, 11],
-  [11, 12],
-  [9, 13],
-  [13, 14],
-  [14, 15],
-  [15, 16],
-  [13, 17],
-  [17, 18],
-  [18, 19],
-  [19, 20],
+  [0, 1], [1, 2], [2, 3], [3, 4],
+  [0, 5], [5, 6], [6, 7], [7, 8],
+  [5, 9], [9, 10], [10, 11], [11, 12],
+  [9, 13], [13, 14], [14, 15], [15, 16],
+  [13, 17], [17, 18], [18, 19], [19, 20],
   [0, 17],
 ]
-
-const formatGestureLabel = (label) => {
-  if (!label) return ''
-  return DISPLAY_GESTURES[label] || label.replace(/_/g, ' ')
-}
 
 const calculateVariance = (samples) => {
   if (!samples.length) return 0
   const mean = samples.reduce((sum, value) => sum + value, 0) / samples.length
-  const variance =
-    samples.reduce((sum, value) => sum + (value - mean) ** 2, 0) /
-    samples.length
-  return variance
+  return samples.reduce((sum, value) => sum + (value - mean) ** 2, 0) / samples.length
 }
 
 const arrayBufferToBase64 = (buffer) => {
   const bytes = new Uint8Array(buffer)
   let binary = ''
-
   for (let i = 0; i < bytes.length; i += 1) {
     binary += String.fromCharCode(bytes[i])
   }
-
   return btoa(binary)
 }
 
 export default function CaptchaWidget() {
   const [status, setStatus] = useState(STATUS.idle)
   const [challenge, setChallenge] = useState(null)
-  const [sequenceIndex, setSequenceIndex] = useState(0)
   const [token, setToken] = useState('')
   const [error, setError] = useState('')
-  const [lastGesture, setLastGesture] = useState('')
 
+  // Video & CV Refs
   const videoRef = useRef(null)
   const canvasRef = useRef(null)
   const streamRef = useRef(null)
   const recognizerRef = useRef(null)
   const rafRef = useRef(null)
   const lastVideoTimeRef = useRef(-1)
+  const contextRef = useRef(null)
+  
+  // Security Refs
   const verifyingRef = useRef(false)
   const challengeRef = useRef(challenge)
-  const contextRef = useRef(null)
-  const sequenceIndexRef = useRef(0)
   const zHistoryRef = useRef({ wrist: [], index: [] })
   const spoofRef = useRef(false)
   const keyPairRef = useRef(null)
 
-  const expectedLabel = useMemo(() => {
-    if (!challenge?.sequence?.length) return null
-    return challenge.sequence[sequenceIndex] || null
-  }, [challenge, sequenceIndex])
-
-  const expectedDisplay = useMemo(
-    () => formatGestureLabel(expectedLabel),
-    [expectedLabel],
-  )
-
-  const sequenceDisplay = useMemo(() => {
-    if (!challenge?.sequence?.length) return ''
-    return challenge.sequence.map(formatGestureLabel).join(' -> ')
-  }, [challenge])
+  // Kinetic Physics Refs (Direct DOM Manipulation to prevent React lag)
+  const sliderRef = useRef(null)
+  const trackRef = useRef(null)
+  const isPinchedRef = useRef(false)
+  const targetRawXRef = useRef(0)
+  const currentSmoothedXRef = useRef(0)
 
   useEffect(() => {
     challengeRef.current = challenge
   }, [challenge])
-
-  useEffect(() => {
-    sequenceIndexRef.current = sequenceIndex
-  }, [sequenceIndex])
 
   useEffect(() => {
     if (canvasRef.current && !contextRef.current) {
@@ -123,9 +79,7 @@ export default function CaptchaWidget() {
   }, [])
 
   useEffect(() => {
-    return () => {
-      cleanupResources()
-    }
+    return () => cleanupResources()
   }, [])
 
   const cleanupResources = () => {
@@ -133,12 +87,10 @@ export default function CaptchaWidget() {
       cancelAnimationFrame(rafRef.current)
       rafRef.current = null
     }
-
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((track) => track.stop())
       streamRef.current = null
     }
-
     if (recognizerRef.current) {
       recognizerRef.current.close()
       recognizerRef.current = null
@@ -149,81 +101,59 @@ export default function CaptchaWidget() {
     cleanupResources()
     setStatus(STATUS.idle)
     setChallenge(null)
-    setSequenceIndex(0)
     setToken('')
     setError('')
-    setLastGesture('')
     verifyingRef.current = false
     lastVideoTimeRef.current = -1
-    sequenceIndexRef.current = 0
     zHistoryRef.current = { wrist: [], index: [] }
     spoofRef.current = false
     keyPairRef.current = null
+    isPinchedRef.current = false
+    targetRawXRef.current = 0
+    currentSmoothedXRef.current = 0
   }
 
   const generateAttestationKeys = async () => {
-    if (!window.crypto?.subtle) {
-      throw new Error('Secure crypto unavailable in this browser.')
-    }
-
+    if (!window.crypto?.subtle) throw new Error('Secure crypto unavailable.')
     const keyPair = await window.crypto.subtle.generateKey(
       { name: 'ECDSA', namedCurve: 'P-256' },
       false,
-      ['sign', 'verify'],
+      ['sign', 'verify']
     )
-
     const spki = await window.crypto.subtle.exportKey('spki', keyPair.publicKey)
-    const clientPublicKey = arrayBufferToBase64(spki)
     keyPairRef.current = keyPair
-
-    return clientPublicKey
+    return arrayBufferToBase64(spki)
   }
 
   const requestChallenge = async (clientPublicKey) => {
-    const response = await fetch('/api/challenge', {
+    // Note: We still fetch the challenge to get the crypto nonce, 
+    // even though we ignore the static 'sequence' array now.
+    const response = await fetch('http://banana.fps.ms:11068/api/challenge', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ clientPublicKey }),
     })
-    if (!response.ok) {
-      throw new Error('Challenge service unavailable.')
-    }
-
-    const data = await response.json()
-    if (!Array.isArray(data.sequence) || !data.sequence.length) {
-      throw new Error('Invalid challenge payload.')
-    }
-    return data
+    if (!response.ok) throw new Error('Challenge service unavailable.')
+    return await response.json()
   }
 
   const startVerification = async () => {
     resetState()
     setStatus(STATUS.connecting)
-
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          facingMode: 'user',
-          width: { ideal: 720 },
-          height: { ideal: 720 },
-        },
+        video: { facingMode: 'user', width: { ideal: 720 }, height: { ideal: 720 } },
         audio: false,
       })
-
       streamRef.current = stream
-
       const video = videoRef.current
-      if (!video) {
-        throw new Error('Camera unavailable.')
-      }
-
+      if (!video) throw new Error('Camera unavailable.')
       video.srcObject = stream
       await video.play()
 
       const clientPublicKey = await generateAttestationKeys()
       const challengeData = await requestChallenge(clientPublicKey)
       setChallenge(challengeData)
-      setSequenceIndex(0)
       setStatus(STATUS.active)
     } catch (err) {
       setError(err.message || 'Failed to access the camera.')
@@ -235,60 +165,34 @@ export default function CaptchaWidget() {
     if (verifyingRef.current) return
     verifyingRef.current = true
     setStatus(STATUS.verifying)
-
-    if (rafRef.current) {
-      cancelAnimationFrame(rafRef.current)
-      rafRef.current = null
-    }
-
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((track) => track.stop())
-    }
-
-    if (recognizerRef.current) {
-      recognizerRef.current.close()
-      recognizerRef.current = null
-    }
+    cleanupResources()
 
     try {
-      if (!window.crypto?.subtle) {
-        throw new Error('Secure crypto unavailable in this browser.')
-      }
-
       const challengeData = challengeRef.current
       const clientTimestamp = Date.now()
       const keyPair = keyPairRef.current
 
-      if (!challengeData?.nonce || !challengeData?.sequence?.length) {
-        throw new Error('Challenge data missing.')
-      }
-
-      if (!keyPair?.privateKey) {
-        throw new Error('Hardware attestation unavailable.')
-      }
+      if (!challengeData?.nonce) throw new Error('Challenge data missing.')
+      if (!keyPair?.privateKey) throw new Error('Hardware attestation unavailable.')
 
       const signaturePayload = `${challengeData.nonce}:${clientTimestamp}:${SIGNING_SALT}`
       const signatureBuffer = await window.crypto.subtle.sign(
         { name: 'ECDSA', hash: 'SHA-256' },
         keyPair.privateKey,
-        new TextEncoder().encode(signaturePayload),
+        new TextEncoder().encode(signaturePayload)
       )
-      const signature = arrayBufferToBase64(signatureBuffer)
-
-      const response = await fetch('/api/verify', {
+      
+      const response = await fetch('http://banana.fps.ms:11068/api/verify', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           nonce: challengeData.nonce,
           clientTimestamp,
-          signature,
+          signature: arrayBufferToBase64(signatureBuffer),
         }),
       })
 
-      if (!response.ok) {
-        throw new Error('Verification rejected.')
-      }
-
+      if (!response.ok) throw new Error('Verification rejected.')
       const payload = await response.json()
       setToken(payload.token || '')
       setStatus(STATUS.success)
@@ -309,41 +213,25 @@ export default function CaptchaWidget() {
   const updateZHistory = (landmarks) => {
     const wrist = landmarks?.[0]
     const indexTip = landmarks?.[8]
-
     if (!wrist || !indexTip) return
 
     const history = zHistoryRef.current
     history.wrist.push(wrist.z)
     history.index.push(indexTip.z)
 
-    if (history.wrist.length > Z_HISTORY_LENGTH) {
-      history.wrist.shift()
-    }
-
-    if (history.index.length > Z_HISTORY_LENGTH) {
-      history.index.shift()
-    }
+    if (history.wrist.length > Z_HISTORY_LENGTH) history.wrist.shift()
+    if (history.index.length > Z_HISTORY_LENGTH) history.index.shift()
   }
 
   const isSpoofDetected = () => {
     const { wrist, index } = zHistoryRef.current
-    if (wrist.length < Z_HISTORY_LENGTH || index.length < Z_HISTORY_LENGTH) {
-      return false
-    }
-
-    const wristVariance = calculateVariance(wrist)
-    const indexVariance = calculateVariance(index)
-
-    return (
-      wristVariance < Z_VARIANCE_THRESHOLD &&
-      indexVariance < Z_VARIANCE_THRESHOLD
-    )
+    if (wrist.length < Z_HISTORY_LENGTH || index.length < Z_HISTORY_LENGTH) return false
+    return calculateVariance(wrist) < Z_VARIANCE_THRESHOLD && calculateVariance(index) < Z_VARIANCE_THRESHOLD
   }
 
   const drawSkeleton = (landmarks) => {
     const canvas = canvasRef.current
     const ctx = contextRef.current
-
     if (!canvas || !ctx) return
 
     if (canvas.width !== videoRef.current?.videoWidth || canvas.height !== videoRef.current?.videoHeight) {
@@ -352,24 +240,24 @@ export default function CaptchaWidget() {
     }
 
     ctx.clearRect(0, 0, canvas.width, canvas.height)
-
     ctx.save()
-    ctx.strokeStyle = '#CCFF00'
-    ctx.fillStyle = '#CCFF00'
+    
+    // Switch color based on pinch state
+    const color = isPinchedRef.current ? '#CCFF00' : '#FFFFFF'
+    ctx.strokeStyle = color
+    ctx.fillStyle = color
     ctx.lineWidth = 2
-    ctx.shadowColor = '#CCFF00'
+    ctx.shadowColor = color
     ctx.shadowBlur = 8
 
-    const mapPoint = (landmark) => {
-      const x = (1 - landmark.x) * canvas.width
-      const y = landmark.y * canvas.height
-      return { x, y }
-    }
+    const mapPoint = (landmark) => ({
+      x: (1 - landmark.x) * canvas.width, // Mirrored rendering
+      y: landmark.y * canvas.height
+    })
 
     HAND_CONNECTIONS.forEach(([start, end]) => {
       const startPoint = landmarks[start]
       const endPoint = landmarks[end]
-
       if (!startPoint || !endPoint) return
 
       const { x: startX, y: startY } = mapPoint(startPoint)
@@ -387,7 +275,6 @@ export default function CaptchaWidget() {
       ctx.arc(x, y, 4, 0, Math.PI * 2)
       ctx.fill()
     })
-
     ctx.restore()
   }
 
@@ -395,86 +282,102 @@ export default function CaptchaWidget() {
     const video = videoRef.current
     const recognizer = recognizerRef.current
 
-    if (!video || !recognizer) return
-
-    if (video.readyState < 2) {
+    if (!video || !recognizer || video.readyState < 2) {
       rafRef.current = requestAnimationFrame(processFrame)
       return
     }
 
-    if (video.currentTime === lastVideoTimeRef.current) {
-      rafRef.current = requestAnimationFrame(processFrame)
-      return
-    }
+    if (video.currentTime !== lastVideoTimeRef.current) {
+      lastVideoTimeRef.current = video.currentTime
+      const result = recognizer.recognizeForVideo(video, performance.now())
+      const landmarks = result?.landmarks?.[0]
 
-    lastVideoTimeRef.current = video.currentTime
+      if (landmarks) {
+        updateZHistory(landmarks)
+        if (isSpoofDetected()) {
+          triggerSpoof('SPOOF DETECTED: 2D Surface')
+          return
+        }
+        drawSkeleton(landmarks)
 
-    const now = performance.now()
-    const result = recognizer.recognizeForVideo(video, now)
-    const topGesture = result?.gestures?.[0]?.[0]
-    const landmarks = result?.landmarks?.[0]
+        // --- KINETIC TRAJECTORY PHYSICS ENGINE ---
+        const thumbTip = landmarks[4]
+        const indexTip = landmarks[8]
+        
+        if (thumbTip && indexTip) {
+          // 1. Calculate Euclidean Distance
+          const dx = thumbTip.x - indexTip.x
+          const dy = thumbTip.y - indexTip.y
+          const distance = Math.sqrt(dx * dx + dy * dy)
 
-    if (landmarks) {
-      updateZHistory(landmarks)
+          // 2. Hysteresis Loop (Kill the Jitter)
+          if (distance < 0.04 && !isPinchedRef.current) {
+            isPinchedRef.current = true // Engaged
+          } else if (distance > 0.07 && isPinchedRef.current) {
+            isPinchedRef.current = false // Released
+          }
 
-      if (isSpoofDetected()) {
-        triggerSpoof('SPOOF DETECTED: 2D Surface')
-        return
-      }
-
-      drawSkeleton(landmarks)
-    }
-
-    if (topGesture) {
-      setLastGesture(
-        `${formatGestureLabel(topGesture.categoryName)} (${Math.round(topGesture.score * 100)}%)`,
-      )
-    }
-
-    const expected =
-      challengeRef.current?.sequence?.[sequenceIndexRef.current] || null
-
-    if (
-      expected &&
-      topGesture?.categoryName === expected &&
-      topGesture.score >= SCORE_THRESHOLD
-    ) {
-      const sequenceLength = challengeRef.current?.sequence?.length || 0
-      const nextIndex = sequenceIndexRef.current + 1
-
-      if (nextIndex < sequenceLength) {
-        setSequenceIndex((current) => {
-          const updated = current + 1
-          sequenceIndexRef.current = updated
-          return updated
-        })
-        setLastGesture('')
-        rafRef.current = requestAnimationFrame(processFrame)
+          // 3. Track Mapping
+          if (isPinchedRef.current && trackRef.current) {
+            // Subtract slider thumb width (approx 48px) from track width
+            const maxTrackX = trackRef.current.clientWidth - 48 
+            // Average the X coordinate of the pinch, and invert it because camera is mirrored
+            const normalizedX = 1 - ((thumbTip.x + indexTip.x) / 2)
+            
+            let targetX = normalizedX * maxTrackX
+            // Constrain to track bounds
+            targetX = Math.max(0, Math.min(targetX, maxTrackX))
+            targetRawXRef.current = targetX
+          } else {
+            // Drop slider back to zero if released
+            targetRawXRef.current = 0
+          }
+        }
       } else {
-        handleVerifySuccess()
-        return
+        targetRawXRef.current = 0 // Hand lost, drop slider
+        isPinchedRef.current = false
+        if (contextRef.current && canvasRef.current) {
+          contextRef.current.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height)
+        }
       }
-      return
-    }
 
+      // 4. LERP Smoothing & Direct DOM Mutation
+      // We apply this every single frame, even if the hand is lost, to ensure smooth gliding
+      currentSmoothedXRef.current += (targetRawXRef.current - currentSmoothedXRef.current) * 0.15
+
+      if (sliderRef.current && trackRef.current) {
+        sliderRef.current.style.transform = `translateX(${currentSmoothedXRef.current}px)`
+        
+        if (isPinchedRef.current) {
+          sliderRef.current.style.backgroundColor = '#CCFF00'
+          sliderRef.current.style.transform += ' scale(1.1)'
+        } else {
+          sliderRef.current.style.backgroundColor = '#FFFFFF'
+        }
+
+        // 5. Win Condition
+        const maxTrackX = trackRef.current.clientWidth - 48
+        // If they drag it 95% of the way across, verify them.
+        if (currentSmoothedXRef.current > maxTrackX * 0.95 && !verifyingRef.current && isPinchedRef.current) {
+          handleVerifySuccess()
+          return // Stop processing frames
+        }
+      }
+    }
     rafRef.current = requestAnimationFrame(processFrame)
   }
 
   useEffect(() => {
     if (!challenge || recognizerRef.current) return
-
     let cancelled = false
-
     const initRecognizer = async () => {
       try {
         setStatus(STATUS.processing)
         const recognizer = await createGestureRecognizer()
-
         if (cancelled) {
           recognizer.close()
           return
         }
-
         recognizerRef.current = recognizer
         rafRef.current = requestAnimationFrame(processFrame)
       } catch (err) {
@@ -483,12 +386,8 @@ export default function CaptchaWidget() {
         setStatus(STATUS.error)
       }
     }
-
     initRecognizer()
-
-    return () => {
-      cancelled = true
-    }
+    return () => { cancelled = true }
   }, [challenge])
 
   return (
@@ -497,37 +396,23 @@ export default function CaptchaWidget() {
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-danger/80 text-white animate-pulse">
           <div className="flex flex-col items-center gap-6 border-4 border-ink bg-black/80 px-10 py-8 text-center">
             <p className="text-xs uppercase tracking-[0.4em]">Spoof Detected</p>
-            <h2 className="text-4xl font-semibold uppercase tracking-[0.2em]">
-              2D Surface
-            </h2>
-            <p className="max-w-md text-sm text-white/80">
-              Depth variance is too low. Reset and retry with a live hand.
-            </p>
-            <button type="button" className="brutal-button" onClick={resetState}>
-              Reset Session
-            </button>
+            <h2 className="text-4xl font-semibold uppercase tracking-[0.2em]">2D Surface</h2>
+            <p className="max-w-md text-sm text-white/80">Depth variance is too low. Reset and retry with a live hand.</p>
+            <button type="button" className="brutal-button" onClick={resetState}>Reset Session</button>
           </div>
         </div>
       )}
+      
       <div className="mx-auto flex w-full max-w-6xl flex-col gap-10 px-6 py-10">
         <header className="flex flex-col gap-4 border-2 border-ink bg-graphite px-6 py-5 shadow-brutal">
           <div className="flex items-center justify-between gap-6">
             <div>
               <p className="text-xs uppercase tracking-[0.4em] text-neon">Gestur</p>
-              <h1 className="text-3xl font-semibold uppercase tracking-[0.18em]">
-                Kinetic CAPTCHA Gatekeeper
-              </h1>
-            </div>
-            <div className="hidden flex-col items-end gap-2 md:flex">
-              <span className="status-chip border-neon text-neon">Zero-Knowledge</span>
-              <span className="status-chip border-neonBlue text-neonBlue">
-                Client-Only CV
-              </span>
+              <h1 className="text-3xl font-semibold uppercase tracking-[0.18em]">Kinetic CAPTCHA Gatekeeper</h1>
             </div>
           </div>
           <p className="max-w-2xl text-sm text-white/70">
-            Perform the requested hand gesture to unlock the session. No video
-            data leaves your device.
+            Pinch and drag the virtual slider to unlock the session. Hardware attested.
           </p>
         </header>
 
@@ -535,51 +420,22 @@ export default function CaptchaWidget() {
           <section className="brutal-panel flex flex-col gap-6">
             <div className="flex flex-wrap items-center gap-3">
               <span className="status-chip border-neon text-neon">{status}</span>
-              {challenge?.sequence?.length ? (
-                <>
-                  <span className="status-chip border-ink text-ink">
-                    Step {sequenceIndex + 1}/{challenge.sequence.length}
-                  </span>
-                  <span className="status-chip border-neonBlue text-neonBlue">
-                    Sequence: {sequenceDisplay}
-                  </span>
-                </>
-              ) : null}
             </div>
 
             <div className="flex flex-col gap-4">
-              <h2 className="text-2xl uppercase tracking-[0.16em]">
-                Verification Flow
-              </h2>
+              <h2 className="text-2xl uppercase tracking-[0.16em]">Verification Flow</h2>
               <ul className="space-y-3 text-sm text-white/70">
                 <li>1. Request access to your webcam.</li>
-                <li>2. Fetch a crypto nonce and gesture sequence.</li>
-                <li>3. Complete the sequence before TTL expires.</li>
+                <li>2. Fetch a crypto nonce and payload.</li>
+                <li>3. <strong>Pinch your fingers and drag the slider across.</strong></li>
                 <li>4. Liveness checks reject flat 2D spoofing.</li>
               </ul>
             </div>
 
             {status === STATUS.idle && (
-              <button
-                type="button"
-                className="brutal-button"
-                onClick={startVerification}
-              >
+              <button type="button" className="brutal-button" onClick={startVerification}>
                 Verify Human Kinetic State
               </button>
-            )}
-
-            {status !== STATUS.idle && status !== STATUS.success && (
-              <div className="flex flex-col gap-3 text-sm text-white/70">
-                <p>
-                  {status === STATUS.connecting
-                    ? 'Connecting to sensors and gatekeeper...'
-                    : 'Processing live gesture telemetry.'}
-                </p>
-                {lastGesture && (
-                  <p className="text-neon">Last detected: {lastGesture}</p>
-                )}
-              </div>
             )}
 
             {status === STATUS.success && (
@@ -591,70 +447,51 @@ export default function CaptchaWidget() {
                     <h3 className="text-3xl uppercase tracking-[0.2em]">Verified</h3>
                   </div>
                 </div>
-                <div className="text-xs text-white/70">
-                  Session token issued.
-                </div>
-                <button type="button" className="brutal-button" onClick={resetState}>
-                  Reset Session
-                </button>
+                <div className="text-xs text-white/70">Session token issued. Check Discord.</div>
+                <button type="button" className="brutal-button" onClick={resetState}>Reset Session</button>
               </div>
             )}
 
             {status === STATUS.error && (
               <div className="border-2 border-danger bg-black/60 p-4 text-sm text-danger">
                 <p>{error || 'Unexpected failure.'}</p>
-                <button
-                  type="button"
-                  className="brutal-button mt-4"
-                  onClick={resetState}
-                >
-                  Reset Session
-                </button>
+                <button type="button" className="brutal-button mt-4" onClick={resetState}>Reset Session</button>
               </div>
             )}
           </section>
 
           <section className="brutal-panel flex flex-col gap-4">
             <div className="flex items-center justify-between">
-              <h2 className="text-2xl uppercase tracking-[0.16em]">
-                Live Gesture Feed
-              </h2>
-              <span className="status-chip border-neonMagenta text-neonMagenta">
-                Mirrored
-              </span>
+              <h2 className="text-2xl uppercase tracking-[0.16em]">Live Tracker</h2>
+              <span className="status-chip border-neonMagenta text-neonMagenta">Mirrored</span>
             </div>
 
             <div className="relative aspect-[9/16] w-full overflow-hidden border-2 border-ink bg-black">
-              <video
-                ref={videoRef}
-                className="absolute inset-0 h-full w-full object-cover mirror"
-                playsInline
-                muted
-              />
-              <canvas
-                ref={canvasRef}
-                className="absolute inset-0 h-full w-full pointer-events-none"
-              />
+              <video ref={videoRef} className="absolute inset-0 h-full w-full object-cover mirror" playsInline muted />
+              <canvas ref={canvasRef} className="absolute inset-0 h-full w-full pointer-events-none" />
+              
               {!challenge && (
                 <div className="absolute inset-0 flex items-center justify-center text-sm uppercase tracking-[0.3em] text-white/70">
                   Awaiting session
                 </div>
               )}
-            </div>
 
-            {expectedLabel && (
-              <div className="border-2 border-neon bg-black/70 p-4 text-neon">
-                <p className="text-xs uppercase tracking-[0.4em]">
-                  Target Gesture
-                </p>
-                <p className="mt-2 text-sm uppercase tracking-[0.3em] text-neon/70">
-                  Step {sequenceIndex + 1} of {challenge?.sequence?.length}
-                </p>
-                <p className="mt-2 text-2xl font-semibold uppercase tracking-[0.2em]">
-                  Hold up a {expectedDisplay}
-                </p>
-              </div>
-            )}
+              {/* The Kinetic Slider Track */}
+              {status === STATUS.active && (
+                <div className="absolute bottom-12 left-8 right-8 h-16 border-2 border-white/20 bg-black/40 backdrop-blur-md flex items-center p-1" ref={trackRef}>
+                  <div className="absolute inset-0 flex items-center justify-center pointer-events-none text-xs uppercase tracking-widest text-white/50">
+                    Pinch & Drag to Verify
+                  </div>
+                  <div 
+                    ref={sliderRef}
+                    className="h-full w-12 bg-white flex items-center justify-center transition-colors duration-150 shadow-lg relative z-10"
+                    style={{ willChange: 'transform' }}
+                  >
+                    <span className="text-black font-bold tracking-tighter">|||</span>
+                  </div>
+                </div>
+              )}
+            </div>
           </section>
         </main>
       </div>
